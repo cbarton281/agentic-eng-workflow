@@ -243,21 +243,46 @@ def parse_preview_paths(text: str) -> list[str]:
     """
     Extract preview paths from text (feature markdown or Cursor output).
 
-    Recognises two formats:
-      1. HTML comment in markdown:  <!-- preview-paths: /path1, /path2 -->
-      2. Plain-text line:           PREVIEW_PATHS: /path1, /path2
+    Recognises several formats:
+      1. HTML comment:    <!-- preview-paths: /path1, /path2 -->
+      2. Inline (with optional bold/backtick markdown):
+           PREVIEW_PATHS: /path1, /path2
+           **PREVIEW_PATHS:** `/path1`, `/path2`
+      3. Heading followed by bullets, code blocks, or bare paths:
+           ### PREVIEW_PATHS
+           - `/path1`
+           - `/path2`
 
     Falls back to ``["/"]`` when nothing is found.
     """
-    for pattern in (
-        r"<!--\s*preview-paths:\s*(.+?)\s*-->",
-        r"PREVIEW_PATHS:\s*(.+)",
-    ):
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
-            if paths:
-                return paths
+    # Format 1: HTML comment
+    m = re.search(r"<!--\s*preview-paths:\s*(.+?)\s*-->", text, re.IGNORECASE)
+    if m:
+        paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
+        if paths:
+            return paths
+
+    # Format 2: same-line paths after PREVIEW_PATHS
+    # Handles: "PREVIEW_PATHS: /a, /b", "**PREVIEW_PATHS:** `/a`, `/b`", etc.
+    # Use [ \t]* instead of \s* to avoid consuming newlines into the next line.
+    m = re.search(r"[#*]*[ \t]*PREVIEW_PATHS[*:]*[ \t]*[*]*[ \t]*(.*)", text, re.IGNORECASE)
+    if m and m.group(1).strip():
+        paths = re.findall(r"(/[a-zA-Z0-9_.[\]/-]+)", m.group(1))
+        if paths:
+            return paths
+
+    # Format 3: heading followed by bullet lines, code-block lines, or bare paths
+    # Handles blank lines, backticks, bullets, and fenced code blocks
+    m = re.search(
+        r"[#*]*\s*PREVIEW_PATHS[*:]*\s*\n[\s`]*\n?((?:.+\n?){1,12})",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        paths = re.findall(r"(/[a-zA-Z0-9_.[\]/-]+)", m.group(1))
+        if paths:
+            return paths
+
     return ["/"]
 
 
@@ -547,6 +572,31 @@ def deploy_with_build_fix_loop(
 # Visual review helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_playwright_browsers() -> None:
+    """
+    Ensure Playwright can find its Chromium binary.
+
+    When browsers were installed with ``PLAYWRIGHT_BROWSERS_PATH=0`` they
+    live inside the venv's site-packages.  Setting the same env var at
+    runtime tells Playwright to look there instead of the default system
+    cache (``~/Library/Caches/ms-playwright``).
+
+    If no local browsers exist, automatically run ``playwright install``.
+    """
+    if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
+    import importlib
+    pw_pkg = importlib.import_module("playwright")
+    local_browsers = Path(pw_pkg.__file__).parent / "driver" / "package" / ".local-browsers"
+    if not local_browsers.exists() or not any(local_browsers.iterdir()):
+        print("  Playwright browsers not found — installing Chromium …")
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+        )
+
+
 def authenticate_and_screenshot(
     frontend_url: str,
     paths: list[str],
@@ -560,6 +610,7 @@ def authenticate_and_screenshot(
 
     Returns a list of saved screenshot file paths.
     """
+    _ensure_playwright_browsers()
     from playwright.sync_api import sync_playwright
 
     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -596,7 +647,15 @@ def authenticate_and_screenshot(
         for idx, path in enumerate(paths):
             url = f"{frontend_url}{path}"
             print(f"  Navigating to {url} …")
-            page.goto(url, wait_until="networkidle")
+            try:
+                page.goto(url, wait_until="networkidle", timeout=60000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(5000)
+                except Exception as e2:
+                    eprint(f"  ⚠️  Failed to load {url}: {e2}")
+                    continue
             page.wait_for_timeout(3000)
 
             safe_name = path.strip("/").replace("/", "-") or "home"
@@ -677,6 +736,7 @@ def _invoke_cursor_visual_fix(
     run_dir: Path,
     critique: str,
     feature_md: str,
+    cursor_summary: str,
     attempt: int,
     cursor_env: dict,
     model: str,
@@ -687,18 +747,54 @@ def _invoke_cursor_visual_fix(
 
     Targets the workspace root so Cursor can modify either repo.
     """
+    # Collect git diffs so Cursor knows exactly what was already changed
+    diff_sections: list[str] = []
+    for repo_name in ("welcomepage-api", "welcomepage-prompts"):
+        repo_path = run_dir / repo_name
+        if repo_path.exists():
+            try:
+                res = subprocess.run(
+                    ["git", "diff", "HEAD~1", "--stat"],
+                    cwd=str(repo_path),
+                    capture_output=True, text=True, check=False,
+                )
+                if res.stdout.strip():
+                    diff_sections.append(
+                        f"### {repo_name} (changed files)\n{res.stdout.strip()}"
+                    )
+            except Exception:
+                pass
+
+    changes_context = "\n\n".join(diff_sections) if diff_sections else "(no diff available)"
+
+    # Truncate very long summaries
+    summary_excerpt = cursor_summary[:3000] if cursor_summary else "(no summary)"
+
     fix_prompt = f"""\
 A QA review of the deployed feature found visual / UI issues (attempt {attempt}).
 
+IMPORTANT CONTEXT — the feature HAS ALREADY BEEN IMPLEMENTED in the existing
+code.  The implementation summary and changed files are shown below.  Your job
+is ONLY to fix the visual/UI issues the QA reviewer found.  Do NOT create new
+pages, routes, or duplicate existing functionality.
+
 ORIGINAL FEATURE SPEC:
 {feature_md}
+
+IMPLEMENTATION SUMMARY (from the initial Cursor run):
+{summary_excerpt}
+
+FILES ALREADY CHANGED:
+{changes_context}
 
 QA CRITIQUE — fix every issue listed below:
 {critique}
 
 Hard requirements:
 - Only fix the visual / UI issues described above.
-- Do NOT add new features or change business logic.
+- Do NOT add new pages, new routes, or new components.
+- Do NOT duplicate or move existing pages.
+- Work within the files that were already created or modified.
 - Commit your changes when done.
 - At the end, summarize what you changed."""
 
@@ -726,6 +822,7 @@ def visual_refinement_loop(
     frontend_url: str,
     frontend_alias_host: str,
     feature_md: str,
+    cursor_summary: str,
     preview_paths: list[str],
     bypass_secret: str,
     test_email: str,
@@ -794,6 +891,7 @@ def visual_refinement_loop(
             run_dir=run_dir,
             critique=critique,
             feature_md=feature_md,
+            cursor_summary=cursor_summary,
             attempt=attempt,
             cursor_env=cursor_env,
             model=model,
@@ -1171,7 +1269,11 @@ Hard requirements:
         print(f"  Planned backend  alias: {api_alias_url}")
         print(f"  Planned frontend alias: {frontend_alias_url}")
 
-        frontend_env_overrides = {"NEXT_PUBLIC_FASTAPI_BASE_URL": api_alias_url}
+        frontend_env_overrides: dict[str, str] = {
+            "NEXT_PUBLIC_FASTAPI_BASE_URL": api_alias_url,
+        }
+        if bypass_secret:
+            frontend_env_overrides["TESTING_AUTH_BYPASS_SECRET"] = bypass_secret
 
         # Deploy backend — wire WEBAPP_URL to the frontend alias.
         print("\n--- Deploying backend ---")
@@ -1257,6 +1359,7 @@ Hard requirements:
                 frontend_url=frontend_alias_url,
                 frontend_alias_host=frontend_alias_host,
                 feature_md=feature_md,
+                cursor_summary=cursor_stdout,
                 preview_paths=preview_paths,
                 bypass_secret=bypass_secret,
                 test_email=test_email,
