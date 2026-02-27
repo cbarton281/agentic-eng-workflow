@@ -1,0 +1,6 @@
+# welcomepage-agentic workflow
+# After install: python -m playwright install chromium
+
+anthropic==0.84.0
+playwright==1.58.0
+python-dotenv==1.2.1

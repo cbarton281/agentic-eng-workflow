@@ -10,13 +10,16 @@ Agentic workflow runner for the Welcomepage project (frontend + backend).
 - Creates a matching feature branch in each
 - Invokes Cursor CLI (headless) to implement the feature across both repos
 - Deploys both repos to Vercel preview via `vercel deploy --target=preview`
+- Screenshots the deployed frontend, analyses it with a vision model, and
+  loops back to Cursor for visual refinements (configurable iterations)
 - Writes a run log capturing ALL console output plus structured metadata
 
 Usage:
-  python welcomepage-agentic.py features/my-feature.md
+  python welcomepage-agentic.py specifications/my-feature.md
 
 Requires:
-  pip install python-dotenv
+  pip install python-dotenv playwright anthropic
+  python -m playwright install chromium
   Vercel CLI installed globally: npm i -g vercel
 
 .env (in same directory as this script):
@@ -27,13 +30,17 @@ Requires:
   VERCEL_ORG_ID=...
   VERCEL_API_PROJECT_ID=...
   VERCEL_FRONTEND_PROJECT_ID=...
+  ANTHROPIC_API_KEY=...
+  TESTING_AUTH_BYPASS_SECRET=...
 
 Optional in .env:
   WELCOMEPAGE_BASE_BRANCH=main
   WELCOMEPAGE_WORK_DIR=./agent-work
+  TESTING_AUTH_EMAIL=your-test@example.com
 """
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -42,6 +49,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -231,6 +239,28 @@ def install_cursor_rules(rules_path: str | None, target_dir: Path) -> None:
     print(f"  Installed cursor rules: {dest_file}")
 
 
+def parse_preview_paths(text: str) -> list[str]:
+    """
+    Extract preview paths from text (feature markdown or Cursor output).
+
+    Recognises two formats:
+      1. HTML comment in markdown:  <!-- preview-paths: /path1, /path2 -->
+      2. Plain-text line:           PREVIEW_PATHS: /path1, /path2
+
+    Falls back to ``["/"]`` when nothing is found.
+    """
+    for pattern in (
+        r"<!--\s*preview-paths:\s*(.+?)\s*-->",
+        r"PREVIEW_PATHS:\s*(.+)",
+    ):
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
+            if paths:
+                return paths
+    return ["/"]
+
+
 # ---------------------------------------------------------------------------
 # Repo helpers
 # ---------------------------------------------------------------------------
@@ -409,6 +439,7 @@ def _invoke_cursor_build_fix(
     build_output: str,
     attempt: int,
     cursor_env: dict,
+    model: str,
     output_format: str,
 ) -> tuple[int, str, str]:
     """
@@ -417,8 +448,6 @@ def _invoke_cursor_build_fix(
     Targets only the single repo that failed, giving Cursor the full
     build output so it can identify and fix the problem.
     """
-    # Truncate very long build logs to the last 300 lines to stay within
-    # reasonable prompt limits while keeping the actual errors (at the end).
     log_lines = build_output.splitlines()
     if len(log_lines) > 300:
         build_excerpt = "\n".join(log_lines[-300:])
@@ -439,7 +468,7 @@ BUILD OUTPUT:
 
     full_cmd = cursor_cmd + [
         "-p", fix_prompt,
-        "--model", "composer-1.5",
+        "--model", model,
         "--force",
         "--print",
         "--output-format", output_format,
@@ -467,6 +496,7 @@ def deploy_with_build_fix_loop(
     max_retries: int,
     cursor_cmd: list[str],
     cursor_env: dict,
+    model: str,
     output_format: str,
 ) -> str:
     """
@@ -505,11 +535,297 @@ def deploy_with_build_fix_loop(
                 build_output=exc.build_output,
                 attempt=attempt,
                 cursor_env=cursor_env,
+                model=model,
                 output_format=output_format,
             )
 
     # Should not reach here, but just in case
     raise last_error or RuntimeError(f"Deploy failed for {repo_label}")
+
+
+# ---------------------------------------------------------------------------
+# Visual review helpers
+# ---------------------------------------------------------------------------
+
+def authenticate_and_screenshot(
+    frontend_url: str,
+    paths: list[str],
+    bypass_secret: str,
+    test_email: str,
+    screenshot_dir: Path,
+) -> list[Path]:
+    """
+    Launch a headless Chromium browser, authenticate via the test-bypass
+    endpoint, navigate to each *path* and capture a full-page screenshot.
+
+    Returns a list of saved screenshot file paths.
+    """
+    from playwright.sync_api import sync_playwright
+
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    screenshots: list[Path] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        page = context.new_page()
+
+        page.goto(frontend_url, wait_until="domcontentloaded")
+
+        encoded_email = urllib.parse.quote(test_email)
+        auth_result = page.evaluate(
+            """async ([endpoint, secret]) => {
+                const resp = await fetch(endpoint, {
+                    headers: { 'x-test-bypass': secret },
+                    credentials: 'include'
+                });
+                return { ok: resp.ok, status: resp.status };
+            }""",
+            [
+                f"/api/auth/test-bypass?email={encoded_email}",
+                bypass_secret,
+            ],
+        )
+
+        if not auth_result.get("ok"):
+            eprint(
+                f"  ⚠️  Auth bypass returned status {auth_result.get('status')} "
+                f"— screenshots may show the login page"
+            )
+
+        for idx, path in enumerate(paths):
+            url = f"{frontend_url}{path}"
+            print(f"  Navigating to {url} …")
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(3000)
+
+            safe_name = path.strip("/").replace("/", "-") or "home"
+            dest = screenshot_dir / f"screenshot-{idx:02d}-{safe_name}.png"
+            page.screenshot(path=str(dest), full_page=True)
+            screenshots.append(dest)
+            print(f"  📸 {dest.name}")
+
+        browser.close()
+
+    return screenshots
+
+
+def analyze_screenshots(
+    screenshot_paths: list[Path],
+    feature_md: str,
+    anthropic_api_key: str,
+) -> tuple[bool, str]:
+    """
+    Send screenshots to a vision model for QA analysis.
+
+    Returns ``(approved, critique_text)``.  The first line of the critique
+    is ``"APPROVED"`` when the model considers the UI production-ready.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    content: list[dict] = []
+    for sp in screenshot_paths:
+        img_b64 = base64.standard_b64encode(sp.read_bytes()).decode("utf-8")
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": img_b64,
+            },
+        })
+
+    content.append({
+        "type": "text",
+        "text": f"""\
+You are a senior QA engineer reviewing a web application.
+A developer just implemented the feature described below.  Review the
+screenshots of the deployed result.
+
+FEATURE SPEC:
+{feature_md}
+
+Evaluate:
+1. Does the implementation match the spec?
+2. Are there visual issues — inconsistent sizing, broken layout, poor spacing,
+   alignment problems, overflow, truncation?
+3. Is the UI polished and production-ready?
+4. Any obvious UX problems?
+
+If everything looks good and production-ready, respond with exactly "APPROVED"
+on the first line.
+
+Otherwise, list specific, actionable fixes as a numbered list.  Focus on what
+needs to change in the code, not the design intent.  Be concise.""",
+    })
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    critique = response.content[0].text.strip()
+    approved = critique.splitlines()[0].strip().upper() == "APPROVED"
+    return approved, critique
+
+
+def _invoke_cursor_visual_fix(
+    cursor_cmd: list[str],
+    run_dir: Path,
+    critique: str,
+    feature_md: str,
+    attempt: int,
+    cursor_env: dict,
+    model: str,
+    output_format: str,
+) -> tuple[int, str, str]:
+    """
+    Invoke Cursor to fix visual / UI issues identified by the vision model.
+
+    Targets the workspace root so Cursor can modify either repo.
+    """
+    fix_prompt = f"""\
+A QA review of the deployed feature found visual / UI issues (attempt {attempt}).
+
+ORIGINAL FEATURE SPEC:
+{feature_md}
+
+QA CRITIQUE — fix every issue listed below:
+{critique}
+
+Hard requirements:
+- Only fix the visual / UI issues described above.
+- Do NOT add new features or change business logic.
+- Commit your changes when done.
+- At the end, summarize what you changed."""
+
+    full_cmd = cursor_cmd + [
+        "-p", fix_prompt,
+        "--model", model,
+        "--force",
+        "--print",
+        "--output-format", output_format,
+    ]
+
+    print(f"\n===== Cursor Visual Fix (attempt {attempt}) =====")
+    rc, stdout, stderr = run_and_capture(full_cmd, cwd=run_dir, env=cursor_env)
+
+    if rc != 0:
+        eprint(f"  ⚠️  Cursor visual fix exited with code {rc}")
+    else:
+        print("  ✅ Cursor visual fix completed")
+
+    return rc, stdout, stderr
+
+
+def visual_refinement_loop(
+    *,
+    frontend_url: str,
+    frontend_alias_host: str,
+    feature_md: str,
+    preview_paths: list[str],
+    bypass_secret: str,
+    test_email: str,
+    anthropic_api_key: str,
+    max_retries: int,
+    run_dir: Path,
+    frontend_dir: Path,
+    vercel_token: str,
+    vercel_org_id: str,
+    vercel_frontend_project_id: str,
+    frontend_env_overrides: dict[str, str] | None,
+    cursor_cmd: list[str],
+    cursor_env: dict,
+    model: str,
+    output_format: str,
+    max_fix_retries: int,
+) -> tuple[bool, str, list[Path]]:
+    """
+    Screenshot → vision analysis → Cursor fix → redeploy loop.
+
+    Returns ``(approved, last_critique, all_screenshot_paths)``.
+    """
+    screenshot_dir = run_dir / "screenshots"
+    all_screenshots: list[Path] = []
+
+    for attempt in range(1, max_retries + 1):
+        print(f"\n===== Visual Review (attempt {attempt}/{max_retries}) =====")
+
+        # ---- Screenshot ----
+        print("\n--- Taking screenshots ---")
+        attempt_dir = screenshot_dir / f"attempt-{attempt}"
+        screenshots = authenticate_and_screenshot(
+            frontend_url, preview_paths, bypass_secret, test_email,
+            attempt_dir,
+        )
+        all_screenshots.extend(screenshots)
+
+        if not screenshots:
+            print("  ⚠️  No screenshots captured — skipping visual review")
+            return True, "", all_screenshots
+
+        # ---- Analyse ----
+        print("\n--- Analysing screenshots with vision model ---")
+        approved, critique = analyze_screenshots(
+            screenshots, feature_md, anthropic_api_key,
+        )
+
+        print("\n  Vision model assessment:")
+        for line in critique.splitlines():
+            print(f"    {line}")
+
+        if approved:
+            print(f"\n  ✅ Visual review APPROVED (attempt {attempt})")
+            return True, critique, all_screenshots
+
+        if attempt >= max_retries:
+            print(
+                f"\n  ⚠️  Visual review not approved after {max_retries} "
+                f"attempt(s).  Proceeding with last version."
+            )
+            return False, critique, all_screenshots
+
+        # ---- Fix ----
+        _invoke_cursor_visual_fix(
+            cursor_cmd=cursor_cmd,
+            run_dir=run_dir,
+            critique=critique,
+            feature_md=feature_md,
+            attempt=attempt,
+            cursor_env=cursor_env,
+            model=model,
+            output_format=output_format,
+        )
+
+        # ---- Redeploy frontend ----
+        print("\n--- Redeploying frontend after visual fix ---")
+        try:
+            new_url = deploy_with_build_fix_loop(
+                repo_dir=frontend_dir,
+                repo_label="welcomepage-prompts (frontend)",
+                vercel_token=vercel_token,
+                vercel_org_id=vercel_org_id,
+                vercel_project_id=vercel_frontend_project_id,
+                env_overrides=frontend_env_overrides,
+                max_retries=max_fix_retries,
+                cursor_cmd=cursor_cmd,
+                cursor_env=cursor_env,
+                model=model,
+                output_format=output_format,
+            )
+            print(f"  🔗 New frontend deploy URL: {new_url}")
+
+            set_vercel_alias(
+                new_url, frontend_alias_host, vercel_token, vercel_org_id,
+            )
+        except (VercelBuildError, RuntimeError) as exc:
+            eprint(f"  ❌ Frontend redeploy failed: {exc}")
+            return False, critique, all_screenshots
+
+    return False, "", all_screenshots
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +891,24 @@ def main():
         help="Path to a Cursor rules markdown file to load into the workspace "
              "(default: cursor-rules.md next to this script).",
     )
+    parser.add_argument(
+        "--model", default="composer-1.5",
+        help="Cursor model to use for all agent invocations (default: composer-1.5).",
+    )
+    parser.add_argument(
+        "--max-visual-retries", type=int, default=2,
+        help="Max visual-review iterations (screenshot → analyse → fix). "
+             "Set to 0 to disable visual review (default: 2).",
+    )
+    parser.add_argument(
+        "--skip-visual-review", action="store_true",
+        help="Skip the visual review / refinement loop entirely.",
+    )
+    parser.add_argument(
+        "--test-email",
+        default=os.getenv("TESTING_AUTH_EMAIL", ""),
+        help="Email address for the auth-bypass endpoint used during visual review.",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -620,6 +954,31 @@ def main():
                     "--skip-deploy / --dry-run."
                 )
 
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    bypass_secret = os.getenv("TESTING_AUTH_BYPASS_SECRET", "").strip()
+    test_email = args.test_email.strip()
+
+    need_visual = (
+        need_deploy
+        and not args.skip_visual_review
+        and args.max_visual_retries > 0
+    )
+    if need_visual:
+        for name, val in [
+            ("ANTHROPIC_API_KEY", anthropic_api_key),
+            ("TESTING_AUTH_BYPASS_SECRET", bypass_secret),
+        ]:
+            if not val:
+                raise RuntimeError(
+                    f"{name} is required for visual review. Set it in .env or use "
+                    "--skip-visual-review."
+                )
+        if not test_email:
+            raise RuntimeError(
+                "A test email is required for visual review. Provide --test-email "
+                "or set TESTING_AUTH_EMAIL in .env."
+            )
+
     # ------------------------------------------------------------------
     # Set up workspace and logging
     # ------------------------------------------------------------------
@@ -651,6 +1010,10 @@ def main():
             vercel_api_project_id=vercel_api_project_id,
             vercel_frontend_project_id=vercel_frontend_project_id,
             need_deploy=need_deploy,
+            need_visual=need_visual,
+            anthropic_api_key=anthropic_api_key,
+            bypass_secret=bypass_secret,
+            test_email=test_email,
             run_dir=run_dir,
             log_path=log_path,
         )
@@ -674,6 +1037,10 @@ def _run_workflow(
     vercel_api_project_id: str,
     vercel_frontend_project_id: str,
     need_deploy: bool,
+    need_visual: bool,
+    anthropic_api_key: str,
+    bypass_secret: str,
+    test_email: str,
     run_dir: Path,
     log_path: Path,
 ):
@@ -748,11 +1115,13 @@ Hard requirements:
 - If you need to add config, prefer safe defaults and document it.
 - Commit your changes in each repo before finishing.
 - At the end, summarize what you changed and list files touched in each repo.
+- Include a line: PREVIEW_PATHS: /path1, /path2
+  listing the frontend routes a reviewer should visit to see your changes.
 """.strip()
 
     full_cmd = cursor_cmd + [
         "-p", prompt,
-        "--model", "composer-1.5",
+        "--model", args.model,
         "--force",
         "--print",
         "--output-format", args.cursor_output_format,
@@ -802,8 +1171,9 @@ Hard requirements:
         print(f"  Planned backend  alias: {api_alias_url}")
         print(f"  Planned frontend alias: {frontend_alias_url}")
 
+        frontend_env_overrides = {"NEXT_PUBLIC_FASTAPI_BASE_URL": api_alias_url}
+
         # Deploy backend — wire WEBAPP_URL to the frontend alias.
-        # If the build fails, Cursor is invoked to fix errors and we retry.
         print("\n--- Deploying backend ---")
         try:
             api_deploy_url = deploy_with_build_fix_loop(
@@ -816,6 +1186,7 @@ Hard requirements:
                 max_retries=args.max_fix_retries,
                 cursor_cmd=cursor_cmd,
                 cursor_env=env,
+                model=args.model,
                 output_format=args.cursor_output_format,
             )
             print(f"  🔗 Backend deploy URL: {api_deploy_url}")
@@ -832,10 +1203,11 @@ Hard requirements:
                 vercel_token=vercel_token,
                 vercel_org_id=vercel_org_id,
                 vercel_project_id=vercel_frontend_project_id,
-                env_overrides={"NEXT_PUBLIC_FASTAPI_BASE_URL": api_alias_url},
+                env_overrides=frontend_env_overrides,
                 max_retries=args.max_fix_retries,
                 cursor_cmd=cursor_cmd,
                 cursor_env=env,
+                model=args.model,
                 output_format=args.cursor_output_format,
             )
             print(f"  🔗 Frontend deploy URL: {frontend_deploy_url}")
@@ -864,7 +1236,50 @@ Hard requirements:
             print("  (skipping frontend alias — deploy failed)")
 
     # ------------------------------------------------------------------
-    # 4) Write structured metadata into a separate JSON file
+    # 4) Visual refinement loop
+    # ------------------------------------------------------------------
+    visual_approved = None
+    visual_critique = ""
+    visual_screenshots: list[Path] = []
+
+    if need_visual and frontend_alias_ok:
+        preview_paths = parse_preview_paths(feature_md)
+        cursor_paths = parse_preview_paths(cursor_stdout)
+        if cursor_paths != ["/"]:
+            for p in cursor_paths:
+                if p not in preview_paths:
+                    preview_paths.append(p)
+
+        print(f"\n  Preview paths for visual review: {preview_paths}")
+
+        visual_approved, visual_critique, visual_screenshots = (
+            visual_refinement_loop(
+                frontend_url=frontend_alias_url,
+                frontend_alias_host=frontend_alias_host,
+                feature_md=feature_md,
+                preview_paths=preview_paths,
+                bypass_secret=bypass_secret,
+                test_email=test_email,
+                anthropic_api_key=anthropic_api_key,
+                max_retries=args.max_visual_retries,
+                run_dir=run_dir,
+                frontend_dir=frontend_dir,
+                vercel_token=vercel_token,
+                vercel_org_id=vercel_org_id,
+                vercel_frontend_project_id=vercel_frontend_project_id,
+                frontend_env_overrides=frontend_env_overrides,
+                cursor_cmd=cursor_cmd,
+                cursor_env=env,
+                model=args.model,
+                output_format=args.cursor_output_format,
+                max_fix_retries=args.max_fix_retries,
+            )
+        )
+    elif need_visual and not frontend_alias_ok:
+        print("\n  (skipping visual review — frontend deploy/alias failed)")
+
+    # ------------------------------------------------------------------
+    # 5) Write structured metadata into a separate JSON file
     # ------------------------------------------------------------------
     _write_structured_log(run_dir, dict(
         feature_path=str(feature_path),
@@ -872,7 +1287,7 @@ Hard requirements:
         branch_name=branch_name,
         base_branch=base_branch,
         cursor=dict(
-            model="composer-1.5",
+            model=args.model,
             output_format=args.cursor_output_format,
             returncode=cursor_rc,
             stdout=cursor_stdout,
@@ -891,6 +1306,13 @@ Hard requirements:
                 alias_url=frontend_alias_url,
                 alias_ok=frontend_alias_ok,
             ),
+        ),
+        visual_review=dict(
+            enabled=need_visual,
+            approved=visual_approved,
+            critique=visual_critique,
+            screenshots=[str(s) for s in visual_screenshots],
+            max_retries=args.max_visual_retries,
         ),
     ))
 
@@ -912,6 +1334,9 @@ Hard requirements:
         print(f"  (raw backend  deploy: {api_deploy_url})")
     if frontend_deploy_url and frontend_alias_ok:
         print(f"  (raw frontend deploy: {frontend_deploy_url})")
+    if visual_approved is not None:
+        status = "APPROVED" if visual_approved else "NOT APPROVED"
+        print(f"  Visual    : {status}")
     print(f"  Log       : {run_dir / 'run.log'}")
     print(f"  Metadata  : {run_dir / 'run-metadata.json'}")
     print("===================\n")
