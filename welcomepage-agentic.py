@@ -10,8 +10,10 @@ Agentic workflow runner for the Welcomepage project (frontend + backend).
 - Creates a matching feature branch in each
 - Invokes Cursor CLI (headless) to implement the feature across both repos
 - Deploys both repos to Vercel preview via `vercel deploy --target=preview`
-- Screenshots the deployed frontend, analyses it with a vision model, and
-  loops back to Cursor for visual refinements (configurable iterations)
+- Explores the deployed frontend via headless browser (Playwright): takes
+  screenshots, generates a test plan with the vision model, executes it
+  (clicking buttons, capturing downloads, etc.), and analyses all artifacts
+- Loops back to Cursor for refinements if the vision model finds issues
 - Writes a run log capturing ALL console output plus structured metadata
 
 Usage:
@@ -597,32 +599,217 @@ def _ensure_playwright_browsers() -> None:
         )
 
 
-def authenticate_and_screenshot(
+def _generate_test_plan(
+    screenshot_paths: list[Path],
+    feature_md: str,
+    anthropic_api_key: str,
+) -> list[dict]:
+    """
+    Ask the vision model to produce a test plan for the new feature.
+
+    Given page screenshots and the feature spec, returns a list of actions
+    like ``[{"action": "click", "target": "Download combined wave GIF"}, ...]``.
+
+    Supported actions:
+      - click(target)          — click a button/link matching the target text
+      - type(target, value)    — type value into an input matching target
+      - wait_for_download()    — wait for a file download to complete
+      - screenshot(label)      — capture a screenshot with the given label
+      - scroll(direction)      — scroll "up" or "down"
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    content: list[dict] = []
+    for sp in screenshot_paths:
+        img_b64 = base64.standard_b64encode(sp.read_bytes()).decode("utf-8")
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": img_b64,
+            },
+        })
+
+    content.append({
+        "type": "text",
+        "text": f"""\
+You are a senior QA engineer planning how to test a NEW FEATURE on a web page.
+The screenshots show the current state of the deployed page.
+
+FEATURE SPEC:
+{feature_md}
+
+Your task: generate a SHORT test plan (JSON array) of browser actions to
+exercise the new feature end-to-end.  The goal is to trigger the feature,
+capture its output (downloads, modals, visual changes), and take screenshots
+of the results.
+
+Available actions (use ONLY these):
+  {{"action": "click", "target": "<visible button/link text>"}}
+  {{"action": "type", "target": "<input placeholder or label>", "value": "<text>"}}
+  {{"action": "wait_for_download"}}
+  {{"action": "screenshot", "label": "<descriptive-label>"}}
+  {{"action": "scroll", "direction": "down"}}
+
+Rules:
+- Keep the plan SHORT (3–8 steps).  Focus on the core feature flow.
+- Always end with a screenshot action.
+- If the feature triggers a file download, include wait_for_download AFTER
+  the click that triggers it, then a screenshot.
+- Use EXACT visible text for click targets (e.g. "Download combined wave GIF").
+- Do NOT test existing features — only the NEW feature from the spec.
+- Respond with ONLY the JSON array.  No explanation, no markdown fences.""",
+    })
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    raw = response.content[0].text.strip()
+    # Strip markdown fences if the model included them
+    if raw.startswith("```"):
+        raw = re.sub(r"^```\w*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+    try:
+        plan = json.loads(raw)
+        if isinstance(plan, list):
+            return plan
+    except json.JSONDecodeError:
+        eprint(f"  ⚠️  Failed to parse test plan JSON: {raw[:200]}")
+
+    return [{"action": "screenshot", "label": "fallback-page-state"}]
+
+
+def _execute_test_plan(
+    page,
+    plan: list[dict],
+    screenshot_dir: Path,
+    start_index: int = 0,
+) -> tuple[list[Path], list[Path]]:
+    """
+    Execute a vision-model-generated test plan using a Playwright page.
+
+    Returns ``(screenshot_paths, download_paths)``.
+    """
+    screenshots: list[Path] = []
+    downloads: list[Path] = []
+    step_idx = start_index
+
+    for step in plan:
+        action = step.get("action", "")
+        print(f"    Step {step_idx}: {action} {step.get('target', step.get('label', ''))}")
+
+        try:
+            if action == "click":
+                target = step.get("target", "")
+                # Try exact text match first, then partial
+                try:
+                    locator = page.get_by_role("button", name=target)
+                    if locator.count() == 0:
+                        locator = page.get_by_text(target, exact=False)
+                    locator.first.click(timeout=10000)
+                except Exception:
+                    # Fallback: try a broad text selector
+                    page.locator(f"text={target}").first.click(timeout=10000)
+                page.wait_for_timeout(2000)
+
+            elif action == "wait_for_download":
+                # If a download was triggered by the previous click, Playwright
+                # should have already started capturing it.  We wait up to 30s.
+                page.wait_for_timeout(5000)
+
+            elif action == "type":
+                target = step.get("target", "")
+                value = step.get("value", "")
+                page.get_by_placeholder(target).first.fill(value)
+                page.wait_for_timeout(1000)
+
+            elif action == "scroll":
+                direction = step.get("direction", "down")
+                delta = 500 if direction == "down" else -500
+                page.mouse.wheel(0, delta)
+                page.wait_for_timeout(1000)
+
+            elif action == "screenshot":
+                label = step.get("label", f"step-{step_idx}")
+                safe_label = re.sub(r"[^a-zA-Z0-9_-]", "-", label)[:60]
+                dest = screenshot_dir / f"explore-{step_idx:02d}-{safe_label}.png"
+                page.screenshot(path=str(dest), full_page=True)
+                screenshots.append(dest)
+                print(f"    📸 {dest.name}")
+
+            else:
+                print(f"    ⚠️  Unknown action: {action}")
+
+        except Exception as exc:
+            eprint(f"    ⚠️  Step {step_idx} failed: {exc}")
+            # Take a screenshot of the failure state
+            fail_dest = screenshot_dir / f"explore-{step_idx:02d}-error.png"
+            try:
+                page.screenshot(path=str(fail_dest), full_page=True)
+                screenshots.append(fail_dest)
+            except Exception:
+                pass
+
+        step_idx += 1
+
+    return screenshots, downloads
+
+
+def explore_and_capture(
     frontend_url: str,
     paths: list[str],
     bypass_secret: str,
     test_email: str,
+    feature_md: str,
+    anthropic_api_key: str,
     screenshot_dir: Path,
-) -> list[Path]:
+) -> tuple[list[Path], list[Path], list[Path]]:
     """
-    Launch a headless Chromium browser, authenticate via the test-bypass
-    endpoint, navigate to each *path* and capture a full-page screenshot.
+    Full exploration flow: navigate → screenshot → generate test plan → execute.
 
-    Returns a list of saved screenshot file paths.
+    Returns ``(page_screenshots, exploration_screenshots, download_paths)``.
     """
     _ensure_playwright_browsers()
     from playwright.sync_api import sync_playwright
 
     screenshot_dir.mkdir(parents=True, exist_ok=True)
-    screenshots: list[Path] = []
+    page_screenshots: list[Path] = []
+    explore_screenshots: list[Path] = []
+    download_paths: list[Path] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            accept_downloads=True,
+        )
         page = context.new_page()
 
-        page.goto(frontend_url, wait_until="domcontentloaded")
+        # Intercept downloads
+        download_dir = screenshot_dir / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
 
+        def _handle_download(download):
+            try:
+                suggested = download.suggested_filename or "download"
+                save_path = download_dir / suggested
+                download.save_as(str(save_path))
+                download_paths.append(save_path)
+                print(f"    📥 Downloaded: {save_path.name}")
+            except Exception as exc:
+                eprint(f"    ⚠️  Download save failed: {exc}")
+
+        page.on("download", _handle_download)
+
+        # --- Authenticate ---
+        page.goto(frontend_url, wait_until="domcontentloaded")
         encoded_email = urllib.parse.quote(test_email)
         auth_result = page.evaluate(
             """async ([endpoint, secret]) => {
@@ -644,6 +831,8 @@ def authenticate_and_screenshot(
                 f"— screenshots may show the login page"
             )
 
+        # --- Phase 1: Navigate and screenshot each path ---
+        print("\n--- Taking page screenshots ---")
         for idx, path in enumerate(paths):
             url = f"{frontend_url}{path}"
             print(f"  Navigating to {url} …")
@@ -659,48 +848,151 @@ def authenticate_and_screenshot(
             page.wait_for_timeout(3000)
 
             safe_name = path.strip("/").replace("/", "-") or "home"
-            dest = screenshot_dir / f"screenshot-{idx:02d}-{safe_name}.png"
+            dest = screenshot_dir / f"page-{idx:02d}-{safe_name}.png"
             page.screenshot(path=str(dest), full_page=True)
-            screenshots.append(dest)
+            page_screenshots.append(dest)
             print(f"  📸 {dest.name}")
+
+        if not page_screenshots:
+            browser.close()
+            return page_screenshots, explore_screenshots, download_paths
+
+        # --- Phase 2: Generate test plan ---
+        print("\n--- Generating exploration test plan ---")
+        plan = _generate_test_plan(
+            page_screenshots, feature_md, anthropic_api_key,
+        )
+        print(f"  Test plan ({len(plan)} steps):")
+        for i, step in enumerate(plan):
+            print(f"    {i}: {step.get('action')} {step.get('target', step.get('label', ''))}")
+
+        # --- Phase 3: Execute test plan ---
+        # Navigate back to the primary feature path (last visited)
+        primary_path = paths[-1] if paths else "/"
+        primary_url = f"{frontend_url}{primary_path}"
+        print(f"\n--- Executing exploration on {primary_url} ---")
+        try:
+            page.goto(primary_url, wait_until="networkidle", timeout=60000)
+        except Exception:
+            page.goto(primary_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(5000)
+        page.wait_for_timeout(2000)
+
+        explore_screenshots, step_downloads = _execute_test_plan(
+            page, plan, screenshot_dir, start_index=len(page_screenshots),
+        )
+        download_paths.extend(step_downloads)
+
+        # If test plan didn't end with a screenshot, capture the final state
+        if not explore_screenshots:
+            final_dest = screenshot_dir / "explore-final.png"
+            page.screenshot(path=str(final_dest), full_page=True)
+            explore_screenshots.append(final_dest)
+            print(f"  📸 {final_dest.name}")
 
         browser.close()
 
-    return screenshots
+    return page_screenshots, explore_screenshots, download_paths
 
 
-def analyze_screenshots(
-    screenshot_paths: list[Path],
+def _image_content_block(image_path: Path) -> dict | None:
+    """Build an Anthropic image content block from a file, or None if unreadable."""
+    suffix = image_path.suffix.lower()
+    media_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    media_type = media_map.get(suffix)
+    if not media_type:
+        return None
+    try:
+        data = image_path.read_bytes()
+        # For GIFs, extract the first frame as PNG for the vision model
+        if suffix == ".gif":
+            from PIL import Image as PILImage
+            with PILImage.open(io.BytesIO(data)) as img:
+                buf = io.BytesIO()
+                img.convert("RGBA").save(buf, format="PNG")
+                data = buf.getvalue()
+                media_type = "image/png"
+        img_b64 = base64.standard_b64encode(data).decode("utf-8")
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": img_b64,
+            },
+        }
+    except Exception:
+        return None
+
+
+def analyze_artifacts(
+    page_screenshots: list[Path],
+    explore_screenshots: list[Path],
+    download_paths: list[Path],
     feature_md: str,
     anthropic_api_key: str,
 ) -> tuple[bool, str]:
     """
-    Send screenshots to a vision model for QA analysis.
+    Send all captured artifacts to a vision model for QA analysis.
 
-    Returns ``(approved, critique_text)``.  The first line of the critique
-    is ``"APPROVED"`` when the model considers the UI production-ready.
+    Includes: page screenshots (before interaction), exploration screenshots
+    (during/after interaction), and downloaded files (images/GIFs rendered
+    as static images).
+
+    Returns ``(approved, critique_text)``.
     """
     import anthropic
 
     client = anthropic.Anthropic(api_key=anthropic_api_key)
 
     content: list[dict] = []
-    for sp in screenshot_paths:
-        img_b64 = base64.standard_b64encode(sp.read_bytes()).decode("utf-8")
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": img_b64,
-            },
-        })
+
+    # Page screenshots
+    if page_screenshots:
+        content.append({"type": "text", "text": "PAGE SCREENSHOTS (before interaction):"})
+        for sp in page_screenshots:
+            block = _image_content_block(sp)
+            if block:
+                content.append(block)
+                content.append({"type": "text", "text": f"({sp.name})"})
+
+    # Exploration screenshots
+    if explore_screenshots:
+        content.append({"type": "text", "text": "EXPLORATION SCREENSHOTS (during/after testing the feature):"})
+        for sp in explore_screenshots:
+            block = _image_content_block(sp)
+            if block:
+                content.append(block)
+                content.append({"type": "text", "text": f"({sp.name})"})
+
+    # Downloaded files
+    if download_paths:
+        content.append({"type": "text", "text": "DOWNLOADED FILES (output produced by the feature):"})
+        for dp in download_paths:
+            block = _image_content_block(dp)
+            if block:
+                content.append(block)
+                content.append({"type": "text", "text": f"Downloaded file: {dp.name}"})
+            else:
+                content.append({
+                    "type": "text",
+                    "text": f"Downloaded file: {dp.name} (non-image, {dp.stat().st_size} bytes)",
+                })
 
     content.append({
         "type": "text",
         "text": f"""\
 You are a senior QA engineer reviewing a NEW FEATURE that was just added to an
-existing web application.  The screenshots show the deployed result.
+existing web application.  You have been given:
+1. Page screenshots showing the page before interaction
+2. Exploration screenshots showing the page during/after exercising the feature
+3. Downloaded files that the feature produced (if any)
 
 FEATURE SPEC (describes ONLY the new feature):
 {feature_md}
@@ -714,12 +1006,14 @@ CRITICAL RULES:
   is intentional and must NOT be changed.
 - Mockup images in the spec show what the NEW FEATURE output should look like,
   NOT how the existing page should be redesigned.
-- If the spec mentions a button, evaluate only that button and the functionality
-  it triggers — not the rest of the page.
+- Pay special attention to DOWNLOADED FILES — these are the primary output of
+  features that produce downloadable content.  Compare them carefully against
+  the spec and mockups.
 
 Evaluate ONLY:
 1. Is the new feature (button, UI element, etc.) present and correctly placed?
-2. Does the new feature's output match the spec when triggered?
+2. If the feature produces output (downloads, generated content), does that
+   output match the spec?  Check sizing, layout, borders, aspect ratio, etc.
 3. Are there visual issues specifically with the NEW feature elements?
 4. Any obvious UX problems with the NEW feature?
 
@@ -859,7 +1153,15 @@ def visual_refinement_loop(
     max_fix_retries: int,
 ) -> tuple[bool, str, list[Path]]:
     """
-    Screenshot → vision analysis → Cursor fix → redeploy loop.
+    Explore → analyse → Cursor fix → redeploy loop.
+
+    Each iteration:
+      1. Navigates to the preview paths and takes page screenshots
+      2. Asks the vision model to generate a test plan for the feature
+      3. Executes the plan (clicks, downloads, etc.) via Playwright
+      4. Sends ALL artifacts (page screenshots, interaction screenshots,
+         downloaded files) to the vision model for review
+      5. If not approved, feeds the critique to Cursor and redeploys
 
     Returns ``(approved, last_critique, all_screenshot_paths)``.
     """
@@ -869,23 +1171,28 @@ def visual_refinement_loop(
     for attempt in range(1, max_retries + 1):
         print(f"\n===== Visual Review (attempt {attempt}/{max_retries}) =====")
 
-        # ---- Screenshot ----
-        print("\n--- Taking screenshots ---")
+        # ---- Explore & Capture ----
         attempt_dir = screenshot_dir / f"attempt-{attempt}"
-        screenshots = authenticate_and_screenshot(
+        page_shots, explore_shots, downloads = explore_and_capture(
             frontend_url, preview_paths, bypass_secret, test_email,
-            attempt_dir,
+            feature_md, anthropic_api_key, attempt_dir,
         )
-        all_screenshots.extend(screenshots)
+        all_screenshots.extend(page_shots)
+        all_screenshots.extend(explore_shots)
 
-        if not screenshots:
+        if not page_shots and not explore_shots:
             print("  ⚠️  No screenshots captured — skipping visual review")
             return True, "", all_screenshots
 
-        # ---- Analyse ----
-        print("\n--- Analysing screenshots with vision model ---")
-        approved, critique = analyze_screenshots(
-            screenshots, feature_md, anthropic_api_key,
+        if downloads:
+            print(f"\n  📦 Captured {len(downloads)} download(s): "
+                  f"{', '.join(d.name for d in downloads)}")
+
+        # ---- Analyse all artifacts ----
+        print("\n--- Analysing artifacts with vision model ---")
+        approved, critique = analyze_artifacts(
+            page_shots, explore_shots, downloads,
+            feature_md, anthropic_api_key,
         )
 
         print("\n  Vision model assessment:")
