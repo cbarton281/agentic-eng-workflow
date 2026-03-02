@@ -699,25 +699,36 @@ def analyze_screenshots(
     content.append({
         "type": "text",
         "text": f"""\
-You are a senior QA engineer reviewing a web application.
-A developer just implemented the feature described below.  Review the
-screenshots of the deployed result.
+You are a senior QA engineer reviewing a NEW FEATURE that was just added to an
+existing web application.  The screenshots show the deployed result.
 
-FEATURE SPEC:
+FEATURE SPEC (describes ONLY the new feature):
 {feature_md}
 
-Evaluate:
-1. Does the implementation match the spec?
-2. Are there visual issues — inconsistent sizing, broken layout, poor spacing,
-   alignment problems, overflow, truncation?
-3. Is the UI polished and production-ready?
-4. Any obvious UX problems?
+CRITICAL RULES:
+- You are reviewing ONLY whether the NEW FEATURE described in the spec was
+  implemented correctly.
+- Do NOT critique or suggest changes to any EXISTING UI elements, page layouts,
+  styling, or components that are not part of the new feature.
+- The existing page design (card shapes, image styles, grid layout, colors, etc.)
+  is intentional and must NOT be changed.
+- Mockup images in the spec show what the NEW FEATURE output should look like,
+  NOT how the existing page should be redesigned.
+- If the spec mentions a button, evaluate only that button and the functionality
+  it triggers — not the rest of the page.
 
-If everything looks good and production-ready, respond with exactly "APPROVED"
-on the first line.
+Evaluate ONLY:
+1. Is the new feature (button, UI element, etc.) present and correctly placed?
+2. Does the new feature's output match the spec when triggered?
+3. Are there visual issues specifically with the NEW feature elements?
+4. Any obvious UX problems with the NEW feature?
 
-Otherwise, list specific, actionable fixes as a numbered list.  Focus on what
-needs to change in the code, not the design intent.  Be concise.""",
+If the new feature appears correctly implemented, respond with exactly the word
+APPROVED on its own line (it may be the first or last line of your response).
+
+If there are issues with the NEW FEATURE ONLY, list specific, actionable fixes
+as a numbered list.  Do NOT include the word APPROVED anywhere if there are
+issues.  Focus on what needs to change in code for the new feature only.""",
     })
 
     response = client.messages.create(
@@ -727,7 +738,8 @@ needs to change in the code, not the design intent.  Be concise.""",
     )
 
     critique = response.content[0].text.strip()
-    approved = critique.splitlines()[0].strip().upper() == "APPROVED"
+    lines_upper = [ln.strip().upper() for ln in critique.splitlines() if ln.strip()]
+    approved = "APPROVED" in lines_upper
     return approved, critique
 
 
@@ -771,14 +783,13 @@ def _invoke_cursor_visual_fix(
     summary_excerpt = cursor_summary[:3000] if cursor_summary else "(no summary)"
 
     fix_prompt = f"""\
-A QA review of the deployed feature found visual / UI issues (attempt {attempt}).
+A QA review of the deployed NEW FEATURE found issues (attempt {attempt}).
 
 IMPORTANT CONTEXT — the feature HAS ALREADY BEEN IMPLEMENTED in the existing
 code.  The implementation summary and changed files are shown below.  Your job
-is ONLY to fix the visual/UI issues the QA reviewer found.  Do NOT create new
-pages, routes, or duplicate existing functionality.
+is ONLY to fix issues with the NEW FEATURE that was added.
 
-ORIGINAL FEATURE SPEC:
+ORIGINAL FEATURE SPEC (describes ONLY the new feature):
 {feature_md}
 
 IMPLEMENTATION SUMMARY (from the initial Cursor run):
@@ -790,11 +801,18 @@ FILES ALREADY CHANGED:
 QA CRITIQUE — fix every issue listed below:
 {critique}
 
-Hard requirements:
-- Only fix the visual / UI issues described above.
+CRITICAL CONSTRAINTS:
+- ONLY fix issues with the NEW FEATURE described in the spec above.
+- Do NOT change the existing page layout, styling, card shapes, image styles,
+  or any UI elements that existed BEFORE this feature was added.
+- The existing page design is intentional.  Mockup images in the spec show
+  what the NEW FEATURE output should look like, NOT how the existing page
+  should be redesigned.
 - Do NOT add new pages, new routes, or new components.
 - Do NOT duplicate or move existing pages.
 - Work within the files that were already created or modified.
+- If the critique asks you to change existing UI that is not part of the new
+  feature, IGNORE that part of the critique.
 - Commit your changes when done.
 - At the end, summarize what you changed."""
 
@@ -1351,6 +1369,11 @@ Hard requirements:
             for p in cursor_paths:
                 if p not in preview_paths:
                     preview_paths.append(p)
+
+        # Drop the generic "/" when we have specific paths — the homepage
+        # is rarely relevant and confuses the vision model.
+        if len(preview_paths) > 1 and "/" in preview_paths:
+            preview_paths.remove("/")
 
         print(f"\n  Preview paths for visual review: {preview_paths}")
 
