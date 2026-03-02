@@ -686,43 +686,101 @@ Rules:
     return [{"action": "screenshot", "label": "fallback-page-state"}]
 
 
+def _find_and_click(page, target: str):
+    """Locate and click an element by visible text, trying several strategies."""
+    try:
+        locator = page.get_by_role("button", name=target)
+        if locator.count() == 0:
+            locator = page.get_by_text(target, exact=False)
+        locator.first.click(timeout=10000)
+    except Exception:
+        page.locator(f"text={target}").first.click(timeout=10000)
+
+
 def _execute_test_plan(
     page,
     plan: list[dict],
     screenshot_dir: Path,
+    download_dir: Path,
     start_index: int = 0,
 ) -> tuple[list[Path], list[Path]]:
     """
     Execute a vision-model-generated test plan using a Playwright page.
+
+    When a ``click`` action is immediately followed by ``wait_for_download``,
+    both steps are combined into a single atomic operation using Playwright's
+    ``expect_download()`` so the download is properly captured even if the
+    server takes a long time to produce the file.
 
     Returns ``(screenshot_paths, download_paths)``.
     """
     screenshots: list[Path] = []
     downloads: list[Path] = []
     step_idx = start_index
+    skip_next = False
 
-    for step in plan:
+    for i, step in enumerate(plan):
+        if skip_next:
+            skip_next = False
+            step_idx += 1
+            continue
+
         action = step.get("action", "")
-        print(f"    Step {step_idx}: {action} {step.get('target', step.get('label', ''))}")
+        print(f"    Step {step_idx}: {action} "
+              f"{step.get('target', step.get('label', ''))}")
+
+        # Look-ahead: click + wait_for_download → combined operation
+        next_step = plan[i + 1] if i + 1 < len(plan) else None
+        next_is_download = (
+            next_step is not None
+            and next_step.get("action") == "wait_for_download"
+        )
 
         try:
-            if action == "click":
+            if action == "click" and next_is_download:
                 target = step.get("target", "")
-                # Try exact text match first, then partial
+                print(f"    Step {step_idx + 1}: wait_for_download "
+                      f"(combined with click, timeout 90s)")
                 try:
-                    locator = page.get_by_role("button", name=target)
-                    if locator.count() == 0:
-                        locator = page.get_by_text(target, exact=False)
-                    locator.first.click(timeout=10000)
-                except Exception:
-                    # Fallback: try a broad text selector
-                    page.locator(f"text={target}").first.click(timeout=10000)
+                    with page.expect_download(timeout=90000) as download_info:
+                        _find_and_click(page, target)
+                    download = download_info.value
+                    suggested = download.suggested_filename or "download"
+                    save_path = download_dir / suggested
+                    download.save_as(str(save_path))
+                    downloads.append(save_path)
+                    print(f"    📥 Downloaded: {save_path.name} "
+                          f"({save_path.stat().st_size:,} bytes)")
+                except Exception as exc:
+                    eprint(f"    ⚠️  Download failed: {exc}")
+                    # Still try the click in case the download part failed
+                    try:
+                        _find_and_click(page, target)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2000)
+                skip_next = True
+
+            elif action == "click":
+                target = step.get("target", "")
+                _find_and_click(page, target)
                 page.wait_for_timeout(2000)
 
             elif action == "wait_for_download":
-                # If a download was triggered by the previous click, Playwright
-                # should have already started capturing it.  We wait up to 30s.
-                page.wait_for_timeout(5000)
+                # Standalone wait_for_download (not preceded by click).
+                # Wait for any download event with a generous timeout.
+                try:
+                    with page.expect_download(timeout=60000) as download_info:
+                        pass
+                    download = download_info.value
+                    suggested = download.suggested_filename or "download"
+                    save_path = download_dir / suggested
+                    download.save_as(str(save_path))
+                    downloads.append(save_path)
+                    print(f"    📥 Downloaded: {save_path.name} "
+                          f"({save_path.stat().st_size:,} bytes)")
+                except Exception as exc:
+                    eprint(f"    ⚠️  No download captured: {exc}")
 
             elif action == "type":
                 target = step.get("target", "")
@@ -749,7 +807,6 @@ def _execute_test_plan(
 
         except Exception as exc:
             eprint(f"    ⚠️  Step {step_idx} failed: {exc}")
-            # Take a screenshot of the failure state
             fail_dest = screenshot_dir / f"explore-{step_idx:02d}-error.png"
             try:
                 page.screenshot(path=str(fail_dest), full_page=True)
@@ -792,21 +849,8 @@ def explore_and_capture(
         )
         page = context.new_page()
 
-        # Intercept downloads
         download_dir = screenshot_dir / "downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
-
-        def _handle_download(download):
-            try:
-                suggested = download.suggested_filename or "download"
-                save_path = download_dir / suggested
-                download.save_as(str(save_path))
-                download_paths.append(save_path)
-                print(f"    📥 Downloaded: {save_path.name}")
-            except Exception as exc:
-                eprint(f"    ⚠️  Download save failed: {exc}")
-
-        page.on("download", _handle_download)
 
         # --- Authenticate ---
         page.goto(frontend_url, wait_until="domcontentloaded")
@@ -879,7 +923,8 @@ def explore_and_capture(
         page.wait_for_timeout(2000)
 
         explore_screenshots, step_downloads = _execute_test_plan(
-            page, plan, screenshot_dir, start_index=len(page_screenshots),
+            page, plan, screenshot_dir, download_dir,
+            start_index=len(page_screenshots),
         )
         download_paths.extend(step_downloads)
 
