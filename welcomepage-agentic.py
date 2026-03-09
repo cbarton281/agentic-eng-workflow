@@ -94,6 +94,81 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+_CURSORIGNORE_CONTENTS = """\
+.git/
+node_modules/
+coverage/
+playwright-report/
+.next/
+__pycache__/
+.pytest_cache/
+dist/
+build/
+*.log
+"""
+
+
+def write_cursorignore(workspace: Path) -> None:
+    """Write a .cursorignore into *workspace* to limit what the agent scans."""
+    ignore_path = workspace / ".cursorignore"
+    if ignore_path.exists():
+        return
+    ignore_path.write_text(_CURSORIGNORE_CONTENTS, encoding="utf-8")
+    print(f"  📄 Wrote {ignore_path}")
+
+
+def extract_cursor_summary(raw_output: str, output_format: str) -> str:
+    """
+    Return a human-readable summary from Cursor CLI output.
+
+    For ``text`` format the raw output is returned as-is.
+
+    For ``stream-json`` the output is NDJSON — one JSON object per line.
+    This function reconstructs the assistant's text by collecting ``textDelta``
+    events (incremental tokens) and noting edited file paths, while skipping
+    the bulky ``beforeFullFileContent`` / ``afterFullFileContent`` payloads
+    that dominate the stream.
+    """
+    if output_format != "stream-json":
+        return raw_output
+
+    parts: list[str] = []
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        etype = event.get("type", "")
+
+        if etype in ("system", "userMessage"):
+            continue
+
+        if etype == "editToolCall":
+            path = event.get("path", "")
+            if path:
+                parts.append(f"\n[edited: {path}]\n")
+            continue
+
+        if etype == "textDelta":
+            text = event.get("text", "")
+            if text:
+                parts.append(text)
+            continue
+
+        text = event.get("text", "") or event.get("content", "")
+        if text and len(text) < 5000:
+            parts.append(text)
+
+    if parts:
+        return "".join(parts)
+
+    return raw_output[:5000]
+
+
 def run(
     cmd: list[str],
     cwd: Path | None = None,
@@ -248,39 +323,47 @@ def parse_preview_paths(text: str) -> list[str]:
     Recognises several formats:
       1. HTML comment:    <!-- preview-paths: /path1, /path2 -->
       2. Inline (with optional bold/backtick markdown):
-           PREVIEW_PATHS: /path1, /path2
-           **PREVIEW_PATHS:** `/path1`, `/path2`
+           PREVIEW_PATHS: /myteam, /dashboard
+           **PREVIEW_PATHS:** `/myteam`, `/dashboard`
       3. Heading followed by bullets, code blocks, or bare paths:
            ### PREVIEW_PATHS
-           - `/path1`
-           - `/path2`
+           - `/myteam`
+           - `/dashboard`
+
+    When multiple PREVIEW_PATHS sections appear (e.g. prompt template + actual
+    Cursor output inside NDJSON), the **last** match wins so the real paths
+    from the assistant response take precedence over any template text.
 
     Falls back to ``["/"]`` when nothing is found.
     """
-    # Format 1: HTML comment
-    m = re.search(r"<!--\s*preview-paths:\s*(.+?)\s*-->", text, re.IGNORECASE)
-    if m:
-        paths = [p.strip() for p in m.group(1).split(",") if p.strip()]
+    # Format 1: HTML comment — use last match
+    matches = list(re.finditer(
+        r"<!--\s*preview-paths:\s*(.+?)\s*-->", text, re.IGNORECASE
+    ))
+    if matches:
+        paths = [p.strip() for p in matches[-1].group(1).split(",") if p.strip()]
         if paths:
             return paths
 
-    # Format 2: same-line paths after PREVIEW_PATHS
-    # Handles: "PREVIEW_PATHS: /a, /b", "**PREVIEW_PATHS:** `/a`, `/b`", etc.
-    # Use [ \t]* instead of \s* to avoid consuming newlines into the next line.
-    m = re.search(r"[#*]*[ \t]*PREVIEW_PATHS[*:]*[ \t]*[*]*[ \t]*(.*)", text, re.IGNORECASE)
-    if m and m.group(1).strip():
-        paths = re.findall(r"(/[a-zA-Z0-9_.[\]/-]+)", m.group(1))
+    # Format 2: same-line paths after PREVIEW_PATHS — use last match
+    matches = list(re.finditer(
+        r"[#*]*[ \t]*PREVIEW_PATHS[*:]*[ \t]*[*]*[ \t]*(.*)",
+        text, re.IGNORECASE,
+    ))
+    for m in reversed(matches):
+        remainder = m.group(1).strip()
+        if not remainder:
+            continue
+        paths = re.findall(r"(/[a-zA-Z0-9_.[\]/-]+)", remainder)
         if paths:
             return paths
 
     # Format 3: heading followed by bullet lines, code-block lines, or bare paths
-    # Handles blank lines, backticks, bullets, and fenced code blocks
-    m = re.search(
+    matches = list(re.finditer(
         r"[#*]*\s*PREVIEW_PATHS[*:]*\s*\n[\s`]*\n?((?:.+\n?){1,12})",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
+        text, re.IGNORECASE,
+    ))
+    for m in reversed(matches):
         paths = re.findall(r"(/[a-zA-Z0-9_.[\]/-]+)", m.group(1))
         if paths:
             return paths
@@ -1118,8 +1201,10 @@ def _invoke_cursor_visual_fix(
 
     changes_context = "\n\n".join(diff_sections) if diff_sections else "(no diff available)"
 
-    # Truncate very long summaries
-    summary_excerpt = cursor_summary[:3000] if cursor_summary else "(no summary)"
+    summary_excerpt = (
+        extract_cursor_summary(cursor_summary, output_format)[:3000]
+        if cursor_summary else "(no summary)"
+    )
 
     fix_prompt = f"""\
 A QA review of the deployed NEW FEATURE found issues (attempt {attempt}).
@@ -1344,7 +1429,9 @@ def main():
     parser.add_argument(
         "--cursor-output-format", default="text",
         choices=["text", "json", "stream-json"],
-        help="Cursor output format.",
+        help="Cursor output format. 'text' (default) is cheapest — stream-json "
+             "includes full file contents in every editToolCall event, greatly "
+             "increasing log size and token cost.",
     )
     parser.add_argument(
         "--max-fix-retries", type=int, default=2,
@@ -1544,6 +1631,9 @@ def _run_workflow(
     for rules_target in (run_dir, api_dir, frontend_dir):
         install_cursor_rules(args.cursor_rules, rules_target)
 
+    # Write .cursorignore so the agent skips .git, node_modules, coverage, etc.
+    write_cursorignore(run_dir)
+
     # ------------------------------------------------------------------
     # 2) Run Cursor agent from workspace root (sees both repos)
     # ------------------------------------------------------------------
@@ -1583,8 +1673,8 @@ Hard requirements:
 - If you need to add config, prefer safe defaults and document it.
 - Commit your changes in each repo before finishing.
 - At the end, summarize what you changed and list files touched in each repo.
-- Include a line: PREVIEW_PATHS: /path1, /path2
-  listing the frontend routes a reviewer should visit to see your changes.
+- Include a line that starts with PREVIEW_PATHS: followed by the frontend routes
+  (comma-separated) a reviewer should visit to see your changes.
 """.strip()
 
     full_cmd = cursor_cmd + [
@@ -1729,12 +1819,16 @@ Hard requirements:
 
         print(f"\n  Preview paths for visual review: {preview_paths}")
 
+        cursor_summary_text = extract_cursor_summary(
+            cursor_stdout, args.cursor_output_format,
+        )
+
         visual_approved, visual_critique, visual_screenshots = (
             visual_refinement_loop(
                 frontend_url=frontend_alias_url,
                 frontend_alias_host=frontend_alias_host,
                 feature_md=feature_md,
-                cursor_summary=cursor_stdout,
+                cursor_summary=cursor_summary_text,
                 preview_paths=preview_paths,
                 bypass_secret=bypass_secret,
                 test_email=test_email,
@@ -1768,7 +1862,7 @@ Hard requirements:
             model=args.model,
             output_format=args.cursor_output_format,
             returncode=cursor_rc,
-            stdout=cursor_stdout,
+            stdout=extract_cursor_summary(cursor_stdout, args.cursor_output_format),
             stderr=cursor_stderr,
         ),
         vercel=dict(
